@@ -463,6 +463,11 @@ def get_config(config_path):
     :param: config_path: path to the configuration file
     :returns: configparser. Parsed configuration options
     """
+    if any(character.isspace() for character in config_path):
+        raise ValueError(
+            'Configuration path cannot contain whitespace'
+        )
+
     config = configparser.ConfigParser()
     if os.path.exists(config_path):
         config.read(config_path)

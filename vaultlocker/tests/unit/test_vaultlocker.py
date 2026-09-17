@@ -60,6 +60,17 @@ class TestVaultlocker(base.TestCase):
 
         return config
 
+    def test_get_config_rejects_path_with_whitespace(self):
+        invalid_paths = [
+            '/path with spaces/vaultlocker.conf',
+            '/path\twith-tab/vaultlocker.conf',
+        ]
+
+        for config_path in invalid_paths:
+            with self.subTest(config_path=config_path):
+                with self.assertRaises(ValueError):
+                    shell.get_config(config_path)
+
     @mock.patch.object(shell.hvac, 'Client')
     def test_vault_client_uses_approle_login(self, _client):
         client = _client.return_value
