@@ -40,22 +40,76 @@ DEFAULT_CONF_FILE = '/etc/vaultlocker/vaultlocker.conf'
 
 REQUIRED_VAULT_SETTINGS = ('url', 'approle', 'secret_id', 'backend')
 
+#: Suffix of the sidecar file pinning the Vault cluster identity.
+CLUSTER_ID_SUFFIX = '.cluster-id'
+
 
 def _vault_client(config):
-    """Helper wrapper to create Vault Client
-
-    :param: config: configparser object of vaultlocker config
-    :returns: hvac.Client. configured Vault Client object
-    """
-    client = hvac.Client(
+    """Create an unauthenticated Vault client."""
+    return hvac.Client(
         url=config.get('vault', 'url'),
-        verify=config.get('vault', 'ca_bundle', fallback=True)
+        verify=config.get('vault', 'ca_bundle', fallback=True),
     )
+
+
+def _login_to_vault(client, config):
+    """Authenticate a Vault client with AppRole credentials."""
     client.auth.approle.login(
         role_id=config.get('vault', 'approle'),
-        secret_id=config.get('vault', 'secret_id')
+        secret_id=config.get('vault', 'secret_id'),
     )
-    return client
+
+
+def _cluster_pin_path(config_path):
+    """Return the cluster pin path for a configuration file."""
+    return '{}{}'.format(config_path, CLUSTER_ID_SUFFIX)
+
+
+def _read_cluster_pin(path):
+    """Read the cluster pin from a sidecar."""
+    try:
+        with open(path, 'r', encoding='utf-8') as sidecar:
+            value = sidecar.read().strip()
+    except (OSError, UnicodeError) as read_error:
+        raise exceptions.ClusterIdentityError(
+            'Unable to read Vault cluster identity {}: {}'.format(
+                path, read_error,
+            )
+        ) from read_error
+    if not value:
+        raise exceptions.ClusterIdentityError(
+            'Invalid Vault cluster identity in {}'.format(path)
+        )
+    return value
+
+
+def _create_cluster_pin(path, cluster_id):
+    """Create the cluster pin without replacing an existing file."""
+    try:
+        with open(path, 'x', encoding='utf-8') as sidecar:
+            sidecar.write(cluster_id)
+    except FileExistsError:
+        return _read_cluster_pin(path)
+    except (OSError, UnicodeError) as write_error:
+        raise exceptions.ClusterIdentityError(
+            'Unable to create Vault cluster identity {}: {}'.format(
+                path, write_error,
+            )
+        ) from write_error
+    return cluster_id
+
+
+def _verify_cluster_identity(client, config_path):
+    """Pin the Vault cluster on first use and verify later connections."""
+    observed_id = vault.get_cluster_id(client)
+
+    pin_path = _cluster_pin_path(config_path)
+    pinned_id = _create_cluster_pin(pin_path, observed_id)
+
+    if pinned_id != observed_id:
+        raise exceptions.ClusterIdentityMismatchError(
+            pinned_id, observed_id,
+        )
 
 
 def _get_kv_version(config):
@@ -607,6 +661,8 @@ def _do_it_with_persistence(func, args, config):
         )
     def _do_it():
         client = _vault_client(config)
+        _verify_cluster_identity(client, args.config)
+        _login_to_vault(client, config)
         return func(args, client, config)
 
     try:

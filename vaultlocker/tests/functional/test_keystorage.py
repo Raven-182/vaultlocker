@@ -34,6 +34,44 @@ class KeyStorageTestCase(base.VaultlockerFuncBaseTestCase):
     Subclasses run this suite against KV version 1 and 2.
     """
 
+    def test_cluster_identity_pin_with_real_vault(
+            self, _luks_open, _luks_format, _boot_unlock,
+            _udevadm_rescan, _udevadm_settle):
+        """The health endpoint provides the value stored in the pin."""
+        shell._verify_cluster_identity(self.vault_client, self.config_path)
+
+        pin_path = shell._cluster_pin_path(self.config_path)
+        with open(pin_path, 'r', encoding='utf-8') as sidecar:
+            self.assertEqual(
+                shell.vault.get_cluster_id(self.vault_client),
+                sidecar.read(),
+            )
+        _luks_open.assert_not_called()
+        _luks_format.assert_not_called()
+        _boot_unlock.register.assert_not_called()
+
+    def test_cluster_mismatch_runs_no_device_operation(
+            self, _luks_open, _luks_format, _boot_unlock,
+            _udevadm_rescan, _udevadm_settle):
+        """A mismatching pin stops before decrypt starts."""
+        pin_path = shell._cluster_pin_path(self.config_path)
+        with open(pin_path, 'w', encoding='utf-8') as sidecar:
+            sidecar.write('different-cluster')
+
+        args = mock.MagicMock()
+        args.uuid = ['passed-UUID']
+        args.retry = -1
+        args.config = self.config_path
+
+        with self.assertRaises(shell.exceptions.ClusterIdentityMismatchError):
+            shell.decrypt(args, self.config)
+
+        _luks_open.assert_not_called()
+        _luks_format.assert_not_called()
+        _boot_unlock.register.assert_not_called()
+        _udevadm_rescan.assert_not_called()
+        _udevadm_settle.assert_not_called()
+
     def test_encrypt(self, _luks_open, _luks_format, _boot_unlock,
                      _udevadm_rescan, _udevadm_settle):
         """Encrypt stores the generated key in Vault."""
