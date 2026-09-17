@@ -27,9 +27,9 @@ import uuid
 import hvac
 import tenacity
 
+from vaultlocker import boot_unlock
 from vaultlocker import dmcrypt
 from vaultlocker import exceptions
-from vaultlocker import systemd
 from vaultlocker import vault
 
 logger = logging.getLogger(__name__)
@@ -278,7 +278,7 @@ def _enroll_block_device(args, client, config, existing_key):
                 )
 
         if not _device_exists(block_uuid):
-            dmcrypt.luks_open(key, block_uuid)
+            dmcrypt.luks_open(key, block_uuid, block_device)
 
     except subprocess.CalledProcessError as luks_error:
         logger.error(
@@ -293,15 +293,13 @@ def _enroll_block_device(args, client, config, existing_key):
             luks_error.output,
         )
 
-    systemd.enable(
-        'vaultlocker-decrypt@{}.service'.format(block_uuid)
-    )
+    boot_unlock.register(block_uuid, args.config)
 
 
 def _encrypt_block_device(args, client, config):
-    """Encrypt and open a block device
+    """Encrypt and open a block device.
 
-    Stores the dm-crypt key direct in vault
+    Store the encryption key in Vault before formatting the device.
 
     :param: args: argparser generated cli arguments
     :param: client: hvac.Client for Vault access
@@ -318,20 +316,11 @@ def _encrypt_block_device(args, client, config):
     )
     store = _vault_store(client, config)
 
-    # NOTE: store and validate key before trying to encrypt disk
+    # Store the key before changing the device.
     _store_and_validate_key(store, path, key)
 
-    # All function calls within try/catch raise a CalledProcessError
-    # if return code is non-zero
-    # This way if any of the calls fail, the key can be removed from vault
     try:
         dmcrypt.luks_format(key, block_device, block_uuid)
-        # Ensure sym link for new encrypted device is created
-        # LP Bug #1780332
-        # TODO(lucas): Temporarily disabled for initial snap packaging
-        # dmcrypt.udevadm_rescan(block_device)
-        # dmcrypt.udevadm_settle(block_uuid)
-        dmcrypt.luks_open(key, block_uuid)
     except subprocess.CalledProcessError as luks_error:
         logger.error(
             'LUKS formatting %s failed with error code: %s\n'
@@ -348,7 +337,25 @@ def _encrypt_block_device(args, client, config):
 
         raise exceptions.LUKSFailure(block_device, luks_error.output)
 
-    systemd.enable('vaultlocker-decrypt@{}.service'.format(block_uuid))
+    try:
+        # Ask udev to create the UUID link used during boot.
+        dmcrypt.udevadm_rescan(block_device)
+        dmcrypt.udevadm_settle(block_uuid)
+    except subprocess.CalledProcessError as udev_error:
+        logger.warning(
+            'udev processing for %s failed with error code: %s\n'
+            'udev output: %s',
+            block_device,
+            udev_error.returncode,
+            udev_error.output,
+        )
+
+    try:
+        dmcrypt.luks_open(key, block_uuid, block_device)
+    except subprocess.CalledProcessError as luks_error:
+        raise exceptions.LUKSFailure(block_device, luks_error.output)
+
+    boot_unlock.register(block_uuid, args.config)
 
 
 def _decrypt_block_device(args, client, config):

@@ -71,25 +71,24 @@ def luks_format(key, device, uuid):
     )
 
 
-def luks_open(key, uuid):
-    """LUKS open a block device by UUID.
-
-    Open a block device using dm-crypt/LUKS with the
-    provided key and uuid
+def luks_open(key, uuid, device=None):
+    """Open a LUKS block device.
 
     :param: key: string containing the encryption key to use.
-    :param: uuid: uuid to use for encrypted block device.
+    :param: uuid: uuid to use for the encrypted block device name.
+    :param: device: optional block device path. If omitted, use the UUID.
     :returns: str. dm-crypt mapping
     """
     logger.info('LUKS opening %s', uuid)
     handle = 'crypt-{}'.format(uuid)
+    source = device if device else 'UUID={}'.format(uuid)
     command = [
         'cryptsetup',
         '--batch-mode',
         '--key-file',
         '-',
         'open',
-        'UUID={}'.format(uuid),
+        source,
         handle,
         '--type',
         'luks',
