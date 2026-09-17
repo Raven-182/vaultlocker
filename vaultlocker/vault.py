@@ -15,8 +15,21 @@ from typing import Any
 
 import hvac
 
+from vaultlocker import exceptions
+
 KV_VERSION_1 = '1'
 KV_VERSION_2 = '2'
+
+
+def get_cluster_id(client: hvac.Client) -> str:
+    """Return a valid cluster ID from the Vault health endpoint."""
+    response = client.sys.read_health_status(method="GET")
+    cluster_id = response.get('cluster_id')
+    if not isinstance(cluster_id, str) or not cluster_id:
+        raise exceptions.ClusterIdentityError(
+            'Vault health response has no valid cluster_id'
+        )
+    return cluster_id
 
 
 class KVStoreBase(abc.ABC):
