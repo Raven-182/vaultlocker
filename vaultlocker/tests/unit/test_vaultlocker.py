@@ -99,10 +99,12 @@ class TestVaultlocker(base.TestCase):
 
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
-    def test_encrypt(self, _dmcrypt, _systemd, _vault_store, _get_hostname):
+    def test_encrypt(self, _dmcrypt, _boot_unlock, _vault_store,
+                     _get_hostname):
         _get_hostname.return_value = 'host'
+        _boot_unlock.running_in_snap.return_value = False
         _dmcrypt.generate_key.return_value = 'testkey'
 
         store = _vault_store.return_value
@@ -127,18 +129,75 @@ class TestVaultlocker(base.TestCase):
         _dmcrypt.luks_format.assert_called_once_with(
             'testkey', '/dev/sdb', 'passed-UUID'
         )
+        _dmcrypt.udevadm_rescan.assert_called_once_with('/dev/sdb')
+        _dmcrypt.udevadm_settle.assert_called_once_with('passed-UUID')
         _dmcrypt.luks_open.assert_called_once_with(
-            'testkey', 'passed-UUID'
+            'testkey', 'passed-UUID', '/dev/sdb'
         )
-        _systemd.enable.assert_called_once_with(
-            'vaultlocker-decrypt@passed-UUID.service'
+        _boot_unlock.register.assert_called_once_with(
+            'passed-UUID', args.config,
+        )
+
+    @mock.patch.object(shell, 'get_hostname', return_value='host')
+    @mock.patch.object(shell, '_vault_store')
+    @mock.patch.object(shell, 'boot_unlock')
+    @mock.patch.object(shell, 'dmcrypt')
+    def test_encrypt_skips_udev_in_snap(self, _dmcrypt, _boot_unlock,
+                                        _vault_store, _get_hostname):
+        _boot_unlock.running_in_snap.return_value = True
+        _dmcrypt.generate_key.return_value = 'testkey'
+        _vault_store.return_value.read.return_value = {
+            'dmcrypt_key': 'testkey',
+        }
+        args = mock.MagicMock()
+        args.uuid = 'passed-UUID'
+        args.block_device = ['/dev/sdb']
+
+        shell._encrypt_block_device(args, mock.MagicMock(), self.config)
+
+        _dmcrypt.udevadm_rescan.assert_not_called()
+        _dmcrypt.udevadm_settle.assert_not_called()
+        _dmcrypt.luks_open.assert_called_once_with(
+            'testkey', 'passed-UUID', '/dev/sdb'
+        )
+        _boot_unlock.register.assert_called_once_with(
+            'passed-UUID', args.config,
+        )
+
+    @mock.patch.object(shell, 'get_hostname', return_value='host')
+    @mock.patch.object(shell, '_vault_store')
+    @mock.patch.object(shell, 'boot_unlock')
+    @mock.patch.object(shell, 'dmcrypt')
+    def test_encrypt_continues_after_udev_failure(
+            self, _dmcrypt, _boot_unlock, _vault_store, _get_hostname):
+        _boot_unlock.running_in_snap.return_value = False
+        _dmcrypt.generate_key.return_value = 'testkey'
+        _dmcrypt.udevadm_rescan.side_effect = subprocess.CalledProcessError(
+            returncode=1, cmd='udevadm trigger', output=b'failed',
+        )
+        _vault_store.return_value.read.return_value = {
+            'dmcrypt_key': 'testkey',
+        }
+        args = mock.MagicMock()
+        args.uuid = 'passed-UUID'
+        args.block_device = ['/dev/sdb']
+
+        shell._encrypt_block_device(args, mock.MagicMock(), self.config)
+
+        _dmcrypt.udevadm_rescan.assert_called_once_with('/dev/sdb')
+        _dmcrypt.udevadm_settle.assert_not_called()
+        _dmcrypt.luks_open.assert_called_once_with(
+            'testkey', 'passed-UUID', '/dev/sdb'
+        )
+        _boot_unlock.register.assert_called_once_with(
+            'passed-UUID', args.config,
         )
 
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
-    def test_encrypt_key_mismatch(self, _dmcrypt, _systemd,
+    def test_encrypt_key_mismatch(self, _dmcrypt, _boot_unlock,
                                   _vault_store, _get_hostname):
         _get_hostname.return_value = 'host'
         _dmcrypt.generate_key.return_value = 'testkey'
@@ -161,7 +220,7 @@ class TestVaultlocker(base.TestCase):
         )
 
         _dmcrypt.luks_format.assert_not_called()
-        _systemd.enable.assert_not_called()
+        _boot_unlock.register.assert_not_called()
 
     @mock.patch.object(shell, '_device_exists', return_value=False)
     @mock.patch.object(shell, 'get_hostname')
@@ -259,9 +318,9 @@ class TestVaultlocker(base.TestCase):
 
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
-    def test_encrypt_luks_failure(self, _dmcrypt, _systemd,
+    def test_encrypt_luks_failure(self, _dmcrypt, _boot_unlock,
                                   _vault_store, _get_hostname):
         _get_hostname.return_value = 'host'
         _dmcrypt.generate_key.return_value = 'testkey'
@@ -287,7 +346,7 @@ class TestVaultlocker(base.TestCase):
         )
 
         store.delete.assert_called_once_with('host/passed-UUID')
-        _systemd.enable.assert_not_called()
+        _boot_unlock.register.assert_not_called()
 
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
@@ -489,10 +548,10 @@ class TestVaultlocker(base.TestCase):
     @mock.patch.object(shell, '_get_or_create_managed_key')
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
     def test_enroll_block_device(
-            self, _dmcrypt, _systemd, _vault_store,
+            self, _dmcrypt, _boot_unlock, _vault_store,
             _get_hostname, _get_managed_key, _device_exists):
         _get_hostname.return_value = 'host'
         _get_managed_key.return_value = 'managed-key'
@@ -533,19 +592,20 @@ class TestVaultlocker(base.TestCase):
         _dmcrypt.luks_open.assert_called_once_with(
             'managed-key',
             'test-uuid',
+            '/dev/sdb',
         )
-        _systemd.enable.assert_called_once_with(
-            'vaultlocker-decrypt@test-uuid.service',
+        _boot_unlock.register.assert_called_once_with(
+            'test-uuid', args.config,
         )
 
     @mock.patch.object(shell, '_device_exists', return_value=True)
     @mock.patch.object(shell, '_get_or_create_managed_key')
     @mock.patch.object(shell, 'get_hostname')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
     def test_enroll_block_device_already_enrolled(
-            self, _dmcrypt, _systemd, _vault_store,
+            self, _dmcrypt, _boot_unlock, _vault_store,
             _get_hostname, _get_managed_key, _device_exists):
         _get_hostname.return_value = 'host'
         _get_managed_key.return_value = 'managed-key'
@@ -568,16 +628,16 @@ class TestVaultlocker(base.TestCase):
 
         _dmcrypt.luks_add_key.assert_not_called()
         _dmcrypt.luks_open.assert_not_called()
-        _systemd.enable.assert_called_once_with(
-            'vaultlocker-decrypt@test-uuid.service',
+        _boot_unlock.register.assert_called_once_with(
+            'test-uuid', args.config,
         )
 
     @mock.patch.object(shell, '_get_or_create_managed_key')
     @mock.patch.object(shell, '_vault_store')
-    @mock.patch.object(shell, 'systemd')
+    @mock.patch.object(shell, 'boot_unlock')
     @mock.patch.object(shell, 'dmcrypt')
     def test_enroll_block_device_rejects_invalid_existing_key(
-            self, _dmcrypt, _systemd, _vault_store,
+            self, _dmcrypt, _boot_unlock, _vault_store,
             _get_managed_key):
         _dmcrypt.luks_uuid.return_value = 'test-uuid'
         _dmcrypt.luks_test_key.return_value = False
@@ -601,7 +661,7 @@ class TestVaultlocker(base.TestCase):
         _get_managed_key.assert_not_called()
         _dmcrypt.luks_add_key.assert_not_called()
         _dmcrypt.luks_open.assert_not_called()
-        _systemd.enable.assert_not_called()
+        _boot_unlock.register.assert_not_called()
 
     @mock.patch.object(
         shell.sys,

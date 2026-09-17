@@ -33,6 +33,7 @@ class KeyStorageTestCase(base.VaultlockerFuncBaseTestCase):
     def test_encrypt(self, _luks_open, _luks_format, _boot_unlock,
                      _udevadm_rescan, _udevadm_settle):
         """Test encrypt function stores correct data in vault"""
+        _boot_unlock.running_in_snap.return_value = False
         args = mock.MagicMock()
         args.uuid = 'passed-UUID'
         args.block_device = ['/dev/sdb']
