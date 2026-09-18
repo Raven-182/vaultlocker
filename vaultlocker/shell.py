@@ -184,7 +184,12 @@ def _store_and_validate_key(store, path, key):
             read_error,
         )
 
-    if key != stored_data['dmcrypt_key']:
+    stored_key = stored_data.get('dmcrypt_key') if isinstance(
+        stored_data, dict) else None
+    if not stored_key:
+        raise exceptions.ManagedKeyInvalidError(vault_path)
+
+    if key != stored_key:
         raise exceptions.VaultKeyMismatch(vault_path)
 
 
@@ -195,10 +200,19 @@ def _read_existing_key(key_file):
 
     :param: key_file: file path, or None to use standard input.
     :returns: bytes containing the existing key.
+    :raises exceptions.ExistingKeyInvalidError: if the key file cannot be
+        read, or the resulting key material is empty.
     """
     if key_file:
-        with open(key_file, 'rb') as key_source:
-            key = key_source.read()
+        try:
+            with open(key_file, 'rb') as key_source:
+                key = key_source.read()
+        except OSError as read_error:
+            raise exceptions.ExistingKeyInvalidError(
+                'Unable to read existing key file {}: {}'.format(
+                    key_file, read_error,
+                )
+            )
     elif sys.stdin.isatty():
         key = getpass.getpass(
             'Existing LUKS passphrase: '
@@ -207,179 +221,333 @@ def _read_existing_key(key_file):
         key = sys.stdin.buffer.read()
 
     if not key:
-        raise ValueError('Existing LUKS key cannot be empty')
+        raise exceptions.ExistingKeyInvalidError(
+            'Existing LUKS key cannot be empty'
+        )
 
     return key
 
 
-def _get_or_create_managed_key(store, path):
-    """Return an existing managed key or create one and store it in Vault.
+def _mapper_path(block_uuid):
+    """Return the dm-crypt mapper path for a LUKS UUID."""
+    return '/dev/mapper/crypt-{}'.format(block_uuid)
 
-    :param: store: Vault key-value store object.
-    :param: path: path to the managed key in Vault.
-    :returns: managed key as str
-    """
+
+def _by_uuid_path(block_uuid):
+    """Return the by-UUID path for a LUKS UUID."""
+    return '/dev/disk/by-uuid/{}'.format(block_uuid)
+
+
+def _register_boot_unlock(block_device, block_uuid, config_path):
+    """Register the device for boot-time unlocking."""
+    try:
+        boot_unlock.register(block_uuid, config_path)
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError) as boot_error:
+        logger.error(
+            'Registering boot unlock for %s failed: %s',
+            block_uuid,
+            _subprocess_error_output(boot_error),
+        )
+        raise exceptions.BootConfigError(
+            block_device, _subprocess_error_output(boot_error),
+        )
+
+
+def _subprocess_error_output(error):
+    """Return output from a subprocess error."""
+    output = getattr(error, 'output', None)
+    if output is None:
+        output = getattr(error, 'stderr', None)
+    return output if output else str(error)
+
+
+def _subprocess_error_returncode(error):
+    """Return a subprocess error's exit code, if available."""
+    return getattr(error, 'returncode', None)
+
+
+# cryptsetup returns 1 when luksUUID finds no LUKS header.
+_NO_LUKS_HEADER_EXIT_CODE = 1
+
+
+def _read_luks_uuid(block_device):
+    """Return the device UUID, or None when it has no LUKS header."""
+    try:
+        return dmcrypt.luks_uuid(block_device)
+    except subprocess.CalledProcessError as luks_error:
+        if luks_error.returncode == _NO_LUKS_HEADER_EXIT_CODE:
+            return None
+        raise exceptions.LuksValidationError(
+            block_device,
+            'Unable to determine whether {} already has a LUKS header '
+            '(cryptsetup exit code {}): {}'.format(
+                block_device,
+                luks_error.returncode,
+                _subprocess_error_output(luks_error),
+            ),
+        )
+    except subprocess.TimeoutExpired as luks_error:
+        raise exceptions.LuksValidationError(
+            block_device,
+            'Timed out determining whether {} already has a LUKS '
+            'header: {}'.format(
+                block_device, _subprocess_error_output(luks_error),
+            ),
+        )
+
+
+def _can_unlock_device(key, block_device):
+    """Return whether a key unlocks a device."""
+    try:
+        return dmcrypt.luks_test_key(key, block_device)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def _read_vault_key(store, path):
+    """Read a Vault key, or return None when the path does not exist."""
     try:
         stored_data = store.read(path)
     except hvac.exceptions.InvalidPath:
-        key = dmcrypt.generate_key()
-        _store_and_validate_key(store, path, key)
-        return key
+        return None
 
-    if (
-            not isinstance(stored_data, dict) or
-            not stored_data.get('dmcrypt_key')
-    ):
-        raise ValueError(
-            'Vault secret at {}/{} does not contain dmcrypt_key'.format(
-                store.mount_point,
-                path,
-            )
+    key = stored_data.get('dmcrypt_key') if isinstance(
+        stored_data, dict) else None
+    if not key:
+        raise exceptions.ManagedKeyInvalidError(
+            '{}/{}'.format(store.mount_point, path)
         )
 
-    return stored_data['dmcrypt_key']
+    return key
 
 
-def _enroll_block_device(args, client, config, existing_key):
-    """Add a Vault-managed key to an existing LUKS device.
+def _ensure_vault_key(store, path, expected_key):
+    """Ensure Vault has the expected key without overwriting data."""
+    current_key = _read_vault_key(store, path)
+    if current_key is None:
+        _store_and_validate_key(store, path, expected_key)
+        return
 
-    :param: args: argparser generated CLI arguments.
-    :param: client: hvac.Client for Vault access.
-    :param: config: configparser object of vaultlocker config.
-    :param: existing_key: existing key used to unlock the device.
+    if current_key != expected_key:
+        raise exceptions.VaultKeyMismatch(
+            '{}/{}'.format(store.mount_point, path)
+        )
+
+
+def _open_and_register_device(block_device, block_uuid, key, config_path):
+    """Open the mapper if needed and register it for boot."""
+    if not _device_exists(block_uuid):
+        try:
+            dmcrypt.luks_open(key, block_uuid, block_device)
+        except (subprocess.CalledProcessError,
+                subprocess.TimeoutExpired) as open_error:
+            raise exceptions.MapperOpenError(
+                block_device, _subprocess_error_output(open_error),
+            )
+
+    _register_boot_unlock(block_device, block_uuid, config_path)
+
+    return {
+        "luks_uuid": block_uuid,
+        "mapper_path": _mapper_path(block_uuid),
+    }
+
+
+def _reuse_encrypted_device(args, client, config, block_device,
+                            block_uuid):
+    """Reuse an encrypted device when its Vault key can unlock it."""
+    if args.uuid and args.uuid != block_uuid:
+        raise exceptions.LuksValidationError(
+            block_device,
+            'device already contains a LUKS header with UUID {} which does '
+            'not match the requested UUID {}'.format(block_uuid, args.uuid),
+        )
+
+    store = _vault_store(client, config)
+    path = _vault_secret_path(block_uuid, config)
+    vault_key = _read_vault_key(store, path)
+
+    if vault_key is None:
+        raise exceptions.LuksValidationError(
+            block_device,
+            'device already contains a LUKS header but no '
+            'vaultlocker-managed key is present in Vault',
+        )
+
+    if not _can_unlock_device(vault_key, block_device):
+        raise exceptions.LuksValidationError(
+            block_device,
+            'device already contains a LUKS header but the managed key '
+            'does not unlock it',
+        )
+
+    return _open_and_register_device(
+        block_device, block_uuid, vault_key, args.config,
+    )
+
+
+def _format_completed(block_device, block_uuid, key):
+    """Check whether a failed or timed-out format completed."""
+    try:
+        current_uuid = dmcrypt.luks_uuid(block_device)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+    if current_uuid != block_uuid:
+        return False
+
+    return _can_unlock_device(key, block_device)
+
+
+def _format_device(args, client, config, block_device, block_uuid, key):
+    """Store the key, format the device, and finish its setup."""
+    store = _vault_store(client, config)
+    path = _vault_secret_path(block_uuid, config)
+
+    _ensure_vault_key(store, path, key)
+
+    try:
+        dmcrypt.luks_format(key, block_device, block_uuid)
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as luks_error:
+        if not _format_completed(block_device, block_uuid, key):
+            logger.error(
+                'LUKS formatting %s failed with error code: %s\n'
+                'LUKS output: %s',
+                block_device,
+                _subprocess_error_returncode(luks_error),
+                _subprocess_error_output(luks_error),
+            )
+            raise exceptions.LuksFormatError(
+                block_device, _subprocess_error_output(luks_error),
+            )
+        logger.warning(
+            'cryptsetup luksFormat for %s reported an error (%s) but the '
+            'device now has the expected UUID and key; continuing',
+            block_device, luks_error,
+        )
+
+    try:
+        # Ask udev to create the by-UUID link used during boot.
+        dmcrypt.udevadm_rescan(block_device)
+        dmcrypt.udevadm_settle(block_uuid)
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as udev_error:
+        logger.warning(
+            'udev processing for %s failed with error code: %s\n'
+            'udev output: %s',
+            block_device,
+            _subprocess_error_returncode(udev_error),
+            _subprocess_error_output(udev_error),
+        )
+        # A confined snap may not run udevadm. Warn until its link appears.
+        if not os.path.exists(_by_uuid_path(block_uuid)):
+            logger.warning(
+                'by-uuid symlink for %s not present yet; udev should '
+                'create it shortly',
+                block_uuid,
+            )
+
+    return _open_and_register_device(
+        block_device, block_uuid, key, args.config,
+    )
+
+
+def _encrypt_block_device(args, client, config, new_uuid,
+                          new_key):
+    """Encrypt a plain device or reuse an encrypted one.
+
+    :param: args: parsed command-line arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: parsed vaultlocker configuration
+    :param: new_uuid: UUID to use when formatting a plain device
+    :param: new_key: key to use when formatting a plain device
+    :returns: dict containing the LUKS UUID and mapper path
+    """
+    block_device = args.block_device[0]
+
+    existing_uuid = _read_luks_uuid(block_device)
+    if existing_uuid is not None:
+        return _reuse_encrypted_device(
+            args, client, config, block_device, existing_uuid,
+        )
+
+    return _format_device(
+        args, client, config, block_device, new_uuid, new_key,
+    )
+
+
+def _enroll_block_device(args, client, config, get_current_key):
+    """Add or reuse a Vault-managed key on an existing LUKS device.
+
+    :param: args: parsed command-line arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: parsed vaultlocker configuration
+    :param: get_current_key: callable that returns the current device key
+    :returns: dict containing the LUKS UUID and mapper path
     """
     block_device = args.block_device[0]
 
     try:
         block_uuid = dmcrypt.luks_uuid(block_device)
-
-        if not dmcrypt.luks_test_key(existing_key, block_device):
-            raise ValueError(
-                'Existing key does not unlock {}'.format(block_device)
-            )
-    except subprocess.CalledProcessError as luks_error:
-        raise exceptions.LUKSFailure(
-            block_device,
-            luks_error.output,
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as luks_error:
+        raise exceptions.LuksValidationError(
+            block_device, _subprocess_error_output(luks_error),
         )
 
-    path = _vault_secret_path(block_uuid, config)
     store = _vault_store(client, config)
-    key = _get_or_create_managed_key(store, path)
-
-    try:
-        if not dmcrypt.luks_test_key(key, block_device):
-            dmcrypt.luks_add_key(
-                existing_key,
-                key,
-                block_device,
-            )
-
-            if not dmcrypt.luks_test_key(key, block_device):
-                raise exceptions.LUKSFailure(
-                    block_device,
-                    'Vaultlocker managed key unable to unlock the device',
-                )
-
-        if not _device_exists(block_uuid):
-            dmcrypt.luks_open(key, block_uuid, block_device)
-
-    except subprocess.CalledProcessError as luks_error:
-        logger.error(
-            'LUKS enrollment for %s failed with error code: %s\n'
-            'LUKS output: %s',
-            block_device,
-            luks_error.returncode,
-            luks_error.output,
-        )
-        raise exceptions.LUKSFailure(
-            block_device,
-            luks_error.output,
-        )
-
-    boot_unlock.register(block_uuid, args.config)
-
-    return {
-        'luks_uuid': block_uuid,
-        'mapper_path': _mapper_path(block_uuid),
-    }
-
-
-def _encrypt_block_device(args, client, config):
-    """Encrypt and open a block device.
-
-    Store the encryption key in Vault before formatting the device.
-
-    :param: args: argparser generated cli arguments
-    :param: client: hvac.Client for Vault access
-    :param: config: configparser object of vaultlocker config
-    """
-    block_device = args.block_device[0]
-    key = dmcrypt.generate_key()
-    block_uuid = str(uuid.uuid4()) if not args.uuid else args.uuid
-
     path = _vault_secret_path(block_uuid, config)
-    vault_path = '{}/{}'.format(
-        _vault_mount_point(config),
-        path,
-    )
-    store = _vault_store(client, config)
+    vault_key = _read_vault_key(store, path)
 
-    # Store the key before changing the device.
-    _store_and_validate_key(store, path, key)
-
-    try:
-        dmcrypt.luks_format(key, block_device, block_uuid)
-    except subprocess.CalledProcessError as luks_error:
-        logger.error(
-            'LUKS formatting %s failed with error code: %s\n'
-            'LUKS output: %s',
-            block_device,
-            luks_error.returncode,
-            luks_error.output,
+    if vault_key is not None and _can_unlock_device(vault_key, block_device):
+        # Reuse an enrolled key without asking for the current key.
+        return _open_and_register_device(
+            block_device, block_uuid, vault_key, args.config,
         )
 
-        try:
-            store.delete(path)
-        except hvac.exceptions.VaultError as del_error:
-            raise exceptions.VaultDeleteError(vault_path, del_error)
+    # Read the current key only when the device needs to change.
+    current_key = get_current_key()
+    if not _can_unlock_device(current_key, block_device):
+        raise exceptions.ExistingKeyInvalidError(
+            'Existing key does not unlock {}'.format(block_device)
+        )
 
-        raise exceptions.LUKSFailure(block_device, luks_error.output)
+    if vault_key is None:
+        vault_key = dmcrypt.generate_key()
+        _store_and_validate_key(store, path, vault_key)
 
     try:
-        # Ask udev to create the UUID link used during boot.
-        dmcrypt.udevadm_rescan(block_device)
-        dmcrypt.udevadm_settle(block_uuid)
-    except subprocess.CalledProcessError as udev_error:
+        dmcrypt.luks_add_key(current_key, vault_key, block_device)
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as luks_error:
         logger.warning(
-            'udev processing for %s failed with error code: %s\n'
-            'udev output: %s',
-            block_device,
-            udev_error.returncode,
-            udev_error.output,
+            'luksAddKey for %s reported an error (%s); checking whether '
+            'the managed key was added despite the error before failing',
+            block_device, luks_error,
         )
 
-    try:
-        dmcrypt.luks_open(key, block_uuid, block_device)
-    except subprocess.CalledProcessError as luks_error:
-        raise exceptions.LUKSFailure(block_device, luks_error.output)
+    if not _can_unlock_device(vault_key, block_device):
+        raise exceptions.LuksAddKeyError(
+            block_device,
+            'Vaultlocker managed key unable to unlock the device',
+        )
 
-    boot_unlock.register(block_uuid, args.config)
-
-    return {
-        'luks_uuid': block_uuid,
-        'mapper_path': _mapper_path(block_uuid),
-    }
+    return _open_and_register_device(
+        block_device, block_uuid, vault_key, args.config,
+    )
 
 
 def _decrypt_block_device(args, client, config):
-    """Open a LUKS/dm-crypt encrypted block device
+    """Open a LUKS/dm-crypt encrypted block device.
 
-    The device's dm-crypt key is retrieved from Vault
+    The device's dm-crypt key is retrieved from Vault.
 
-    :param: args: argparser generated cli arguments
+    :param: args: parsed command-line arguments
     :param: client: hvac.Client for Vault access
-    :param: config: configparser object of vaultlocker config
+    :param: config: parsed vaultlocker configuration
     """
     block_uuid = args.uuid[0]
 
@@ -393,21 +561,20 @@ def _decrypt_block_device(args, client, config):
     path = _vault_secret_path(block_uuid, config)
     store = _vault_store(client, config)
 
-    try:
-        stored_data = store.read(path)
-    except hvac.exceptions.InvalidPath:
-        raise ValueError(
-            'Unable to locate key for {}'.format(block_uuid)
+    vault_key = _read_vault_key(store, path)
+    if vault_key is None:
+        raise exceptions.ManagedKeyNotFoundError(
+            '{}/{}'.format(store.mount_point, path)
         )
 
-    key = stored_data['dmcrypt_key']
-
-    dmcrypt.luks_open(key, block_uuid)
-
-
-def _mapper_path(block_uuid):
-    """Return the dm-crypt mapper path for a LUKS UUID."""
-    return '/dev/mapper/crypt-{}'.format(block_uuid)
+    try:
+        dmcrypt.luks_open(vault_key, block_uuid)
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as open_error:
+        raise exceptions.MapperOpenError(
+            'UUID={}'.format(block_uuid),
+            _subprocess_error_output(open_error),
+        )
 
 
 def _device_exists(block_uuid):
@@ -418,11 +585,12 @@ def _device_exists(block_uuid):
 
 
 def _do_it_with_persistence(func, args, config):
-    """Exec func with retries based on provided cli flags
+    """Run a Vault operation using the configured retry window.
 
     :param: func: function to attempt to execute
     :param: args: argparser generated cli arguments
     :param: config: configparser object of vaultlocker config
+    :returns: the operation result
     """
     @tenacity.retry(
         wait=tenacity.wait_fixed(1),
@@ -432,8 +600,9 @@ def _do_it_with_persistence(func, args, config):
             else tenacity.stop_after_attempt(1)
             ),
         retry=(
-            tenacity.retry_if_exception(hvac.exceptions.VaultNotInitialized) |
-            tenacity.retry_if_exception(hvac.exceptions.VaultDown)
+            tenacity.retry_if_exception_type(
+                hvac.exceptions.VaultNotInitialized) |
+            tenacity.retry_if_exception_type(hvac.exceptions.VaultDown)
             )
         )
     def _do_it():
@@ -447,38 +616,58 @@ def _do_it_with_persistence(func, args, config):
 
 
 def encrypt(args, config):
-    """Encrypt and open handler
+    """Encrypt and open handler.
+
+    Generate one UUID and key, then reuse them for every retry.
 
     :param: args: argparser generated cli arguments
     :param: config: configparser object of vaultlocker config
     """
-    return _do_it_with_persistence(_encrypt_block_device, args, config)
+    new_uuid = args.uuid or str(uuid.uuid4())
+    new_key = dmcrypt.generate_key()
+
+    encrypt_device = functools.partial(
+        _encrypt_block_device,
+        new_uuid=new_uuid,
+        new_key=new_key,
+    )
+
+    return _do_it_with_persistence(encrypt_device, args, config)
 
 
 def enroll(args, config):
     """Enroll and open handler.
 
-    :param: args: argparser generated CLI arguments.
-    :param: config: configparser object of vaultlocker config.
-    """
-    # Read the existing key once because stdin cannot be reread during retries,
-    # then bind it to the enrollment operation.
-    existing_key = _read_existing_key(args.existing_key_file)
+    Read the current key only when the device needs to change.
 
-    enroll_operation = functools.partial(
+    :param: args: argparser generated CLI arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    current_key_cache = {}
+
+    def get_current_key():
+        if 'value' not in current_key_cache:
+            current_key_cache['value'] = _read_existing_key(
+                args.existing_key_file,
+            )
+        return current_key_cache['value']
+
+    enroll_device = functools.partial(
         _enroll_block_device,
-        existing_key=existing_key,
+        get_current_key=get_current_key,
     )
 
     return _do_it_with_persistence(
-        enroll_operation,
+        enroll_device,
         args,
         config,
     )
 
 
 def decrypt(args, config):
-    """Decrypt and open handler
+    """Decrypt and open handler.
+
+    The device's dm-crypt key is retrieved from Vault.
 
     :param: args: argparser generated cli arguments
     :param: config: configparser object of vaultlocker config
@@ -491,6 +680,7 @@ def get_config(config_path):
 
     :param: config_path: path to the configuration file
     :returns: configparser. Parsed configuration options
+    :raises exceptions.ConfigurationError: if the file is invalid
     """
     config = configparser.ConfigParser()
 
@@ -594,19 +784,21 @@ def main():
             if isinstance(result, dict):
                 print(json.dumps(result))
     except exceptions.VaultlockerException as vault_error:
+        # Controlled errors are safe to retry.
         print(
             json.dumps({
-                'error': str(vault_error),
-                'retryable': True,
+                "error": str(vault_error),
+                "retryable": True,
             }),
             file=sys.stderr,
         )
         sys.exit(ExitCode.RETRYABLE_FAILURE)
     except Exception as error:
+        # Unknown errors may not be safe to retry.
         print(
             json.dumps({
-                'error': str(error),
-                'retryable': False,
+                "error": str(error),
+                "retryable": False,
             }),
             file=sys.stderr,
         )
