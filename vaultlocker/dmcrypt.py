@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 KEY_SIZE = 4096
 
+#: Maximum time to wait for a cryptsetup command.
+CRYPTSETUP_TIMEOUT_SECONDS = 300
+
+#: Maximum time to wait for a udevadm command.
+UDEVADM_TIMEOUT_SECONDS = 60
+
 
 def _key_bytes(key):
     """Normalize key material for subprocess input.
@@ -68,15 +74,20 @@ def luks_format(key, device, uuid):
     subprocess.check_output(
         command,
         input=_key_bytes(key),
+        timeout=CRYPTSETUP_TIMEOUT_SECONDS,
     )
 
 
 def luks_open(key, uuid, device=None):
-    """Open a LUKS block device.
+    """LUKS open a block device.
+
+    Open a block device using dm-crypt/LUKS with the provided key.
 
     :param: key: string containing the encryption key to use.
     :param: uuid: uuid to use for the encrypted block device name.
-    :param: device: optional block device path. If omitted, use the UUID.
+    :param: device: optional block device path to open. When omitted the
+        device is resolved from the by-uuid symlink (used at boot when
+        only the UUID is known).
     :returns: str. dm-crypt mapping
     """
     logger.info('LUKS opening %s', uuid)
@@ -96,6 +107,7 @@ def luks_open(key, uuid, device=None):
     subprocess.check_output(
         command,
         input=_key_bytes(key),
+        timeout=CRYPTSETUP_TIMEOUT_SECONDS,
     )
     return handle
 
@@ -112,7 +124,10 @@ def luks_uuid(device):
         'luksUUID',
         device,
     ]
-    return subprocess.check_output(command).decode('utf-8').strip()
+    return subprocess.check_output(
+        command,
+        timeout=CRYPTSETUP_TIMEOUT_SECONDS,
+    ).decode('utf-8').strip()
 
 
 def luks_test_key(key, device):
@@ -138,6 +153,7 @@ def luks_test_key(key, device):
         subprocess.check_output(
             command,
             input=_key_bytes(key),
+            timeout=CRYPTSETUP_TIMEOUT_SECONDS,
         )
     except subprocess.CalledProcessError as exc:
         if exc.returncode == 2:
@@ -180,6 +196,7 @@ def luks_add_key(existing_key, new_key, device):
             command,
             input=_key_bytes(new_key),
             pass_fds=(existing_key_fd,),
+            timeout=CRYPTSETUP_TIMEOUT_SECONDS,
         )
     finally:
         os.close(existing_key_fd)
@@ -200,7 +217,10 @@ def udevadm_rescan(device):
         '--name-match={}'.format(device),
         '--action=add'
     ]
-    subprocess.check_output(command)
+    subprocess.check_output(
+        command,
+        timeout=UDEVADM_TIMEOUT_SECONDS,
+    )
 
 
 def udevadm_settle(uuid):
@@ -217,4 +237,7 @@ def udevadm_settle(uuid):
         'settle',
         '--exit-if-exists=/dev/disk/by-uuid/{}'.format(uuid),
     ]
-    subprocess.check_output(command)
+    subprocess.check_output(
+        command,
+        timeout=UDEVADM_TIMEOUT_SECONDS,
+    )
