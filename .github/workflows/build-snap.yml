@@ -1,0 +1,38 @@
+name: vaultlocker snap
+
+on:
+  - pull_request
+  - push
+
+jobs:
+  build:
+    name: Build snap
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # Retrieve tags for versioning
+
+      - name: Set up LXD
+        uses: canonical/setup-lxd@v1
+
+      - name: Build snap
+        id: vaultlocker
+        uses: snapcore/action-build@v1
+
+      - name: Upload snap artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap
+          path: ${{ steps.vaultlocker.outputs.snap }}
+
+      - name: Install snap
+        run: |
+          sudo snap install --dangerous ${{ steps.vaultlocker.outputs.snap }}
+          sudo snap connect vaultlocker:network
+          sudo snap connect vaultlocker:dm-crypt
+          sudo snap connect vaultlocker:block-devices
+
+      - name: Verify snap help
+        run: vaultlocker -h

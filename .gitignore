@@ -3,6 +3,11 @@
 # C extensions
 *.so
 
+# Snap artifacts
+*.snap
+prime/
+squashfs-root/
+
 # Packages
 *.egg*
 *.egg-info

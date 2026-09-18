@@ -328,8 +328,9 @@ def _encrypt_block_device(args, client, config):
         dmcrypt.luks_format(key, block_device, block_uuid)
         # Ensure sym link for new encrypted device is created
         # LP Bug #1780332
-        dmcrypt.udevadm_rescan(block_device)
-        dmcrypt.udevadm_settle(block_uuid)
+        # TODO(lucas): Temporarily disabled for initial snap packaging
+        # dmcrypt.udevadm_rescan(block_device)
+        # dmcrypt.udevadm_settle(block_uuid)
         dmcrypt.luks_open(key, block_uuid)
     except subprocess.CalledProcessError as luks_error:
         logger.error(

@@ -1,0 +1,48 @@
+name: vaultlocker
+base: core24
+summary: Automated storage and retrieval of dm-crypt keys using Vault
+description: |
+  Vault provides a nice way to manage secrets within complex software deployments.
+
+  vaultlocker provides a way to store and retrieve dm-crypt encryption keys in
+  Vault, automatically retrieving keys and opening LUKS dm-crypt devices on boot.
+
+adopt-info: vaultlocker
+platforms:
+  amd64:
+  arm64:
+  s390x:
+  riscv64:
+  ppc64el:
+
+confinement: strict
+
+parts:
+  vaultlocker:
+    plugin: python
+    source: .
+    build-packages:
+      - git
+    stage-packages:
+      - cryptsetup
+    override-build: |
+      if version=$(git describe --exact-match --tags 2>/dev/null); then
+        grade=stable
+      else
+        version=$(git describe --tags --dirty)
+        grade=devel
+      fi
+
+      export PBR_VERSION="${version}"
+
+      craftctl set version="${version}"
+      craftctl set grade="${grade}"
+      craftctl default
+
+apps:
+  vaultlocker:
+    command: bin/vaultlocker
+    plugs:
+      - network
+      - dm-crypt
+      - block-devices
